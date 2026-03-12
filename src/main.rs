@@ -105,15 +105,9 @@ async fn main() {
             }
         });
 
-        // 后台每 60 秒健康检测一次
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.tick().await; // 跳过第一次立即触发
-            loop {
-                interval.tick().await;
-                pool.health_check_all().await;
-            }
-        });
+        // 健康检测已禁用（探测端点在部分网络不可达，导致代理误判为故障）
+        // 代理故障由实际请求的网络错误/429 触发换代理
+        let _ = pool;
     }
 
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
