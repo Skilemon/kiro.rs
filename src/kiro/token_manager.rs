@@ -975,22 +975,9 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
-                // 代理优先级：凭据自身代理 > 代理池分配代理 > 全局代理
-                let effective_proxy = if current_creds.proxy_url.is_some() {
-                    current_creds.effective_proxy(self.proxy.as_ref())
-                } else if let Some(pool) = &self.proxy_pool {
-                    match pool.assign_proxy_for(id).await {
-                        Ok(p) => Some(p),
-                        Err(e) => {
-                            tracing::warn!("代理池获取代理失败，回退到全局代理: {}", e);
-                            self.proxy.clone()
-                        }
-                    }
-                } else {
-                    current_creds.effective_proxy(self.proxy.as_ref())
-                };
+                // Token 刷新不使用代理，走直连
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                    refresh_token(&current_creds, &self.config, None).await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");

@@ -5,7 +5,11 @@
       "Bash(cargo check:*)",
       "Bash(cargo test:*)",
       "Bash(curl:*)",
-      "Bash(docker-compose ps:*)"
+      "Bash(docker-compose ps:*)",
+      "Bash(Get-ChildItem:*)",
+      "Bash(Get-Content $_FullName })",
+      "Bash(cmd /c:*)",
+      "Bash(exit:*)"
     ]
   }
 }
