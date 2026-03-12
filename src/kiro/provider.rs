@@ -389,7 +389,7 @@ impl KiroProvider {
                 continue;
             }
 
-            // 瞬态错误
+            // 瞬态错误，429 时额外触发换代理
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -398,6 +398,9 @@ impl KiroProvider {
                     status,
                     body
                 );
+                if status.as_u16() == 429 {
+                    self.token_manager.report_proxy_failure(ctx.id);
+                }
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
@@ -459,6 +462,20 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            // 打印当前请求使用的代理
+            {
+                let proxy_info = if ctx.credentials.proxy_url.is_some() {
+                    ctx.credentials.proxy_url.clone().unwrap()
+                } else if let Some(pool) = self.token_manager.proxy_pool() {
+                    pool.get_proxy_for(ctx.id)
+                        .map(|p| p.url)
+                        .unwrap_or_else(|| self.global_proxy.as_ref().map(|p| p.url.clone()).unwrap_or_else(|| "直连".to_string()))
+                } else {
+                    self.global_proxy.as_ref().map(|p| p.url.clone()).unwrap_or_else(|| "直连".to_string())
+                };
+                tracing::info!("凭据 #{} 使用代理: {}", ctx.id, proxy_info);
+            }
 
             // 发送请求
             let response = match self
@@ -563,6 +580,7 @@ impl KiroProvider {
 
             // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
             // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
+            // 429 时额外触发换代理，尝试通过新 IP 绕过限流
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -571,6 +589,9 @@ impl KiroProvider {
                     status,
                     body
                 );
+                if status.as_u16() == 429 {
+                    self.token_manager.report_proxy_failure(ctx.id);
+                }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
