@@ -16,5 +16,5 @@
   "proxyPassword": null,
   "adminApiKey": "sk-admin-your-secret-key",
   "loadBalancingMode": "balanced",
-  "proxyApiUrl": "http://host.docker.internal:8416/api/getSingleProxy?protocol=http&delay=500"
+  "proxyApiUrl": "http://host.docker.internal:8416/api/getSingleProxy"
 }

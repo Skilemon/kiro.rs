@@ -5,5 +5,5 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
-  "proxyApiUrl": "http://your-proxy-api/getSingleProxy?protocol=http&delay=500"
+  "proxyApiUrl": "http://your-proxy-api/getSingleProxy"
 }
