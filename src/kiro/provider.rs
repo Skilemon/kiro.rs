@@ -591,6 +591,22 @@ impl KiroProvider {
                 );
                 if status.as_u16() == 429 {
                     self.token_manager.report_proxy_failure(ctx.id);
+                    // 立即为该凭据分配新代理并预热 client_cache
+                    if let Some(pool) = self.token_manager.proxy_pool() {
+                        match pool.assign_proxy_for(ctx.id).await {
+                            Ok(new_proxy) => {
+                                tracing::info!("凭据 #{} 换用新代理: {}", ctx.id, new_proxy.url);
+                                // 预热新代理对应的 Client
+                                let _ = self.client_cache.lock()
+                                    .entry(Some(new_proxy.clone()))
+                                    .or_insert_with(|| {
+                                        crate::http_client::build_client(Some(&new_proxy), 720, self.tls_backend)
+                                            .expect("构建代理 Client 失败")
+                                    });
+                            }
+                            Err(e) => tracing::warn!("凭据 #{} 换代理失败: {}", ctx.id, e),
+                        }
+                    }
                 }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
