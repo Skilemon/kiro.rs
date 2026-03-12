@@ -1,0 +1,14 @@
+{
+  "2": {
+    "cached_at": 1773307199.0,
+    "data": {
+      "id": 2,
+      "subscriptionTitle": "KIRO FREE",
+      "currentUsage": 466.19,
+      "usageLimit": 550.0,
+      "remaining": 83.81,
+      "usagePercentage": 84.76181818181819,
+      "nextResetAt": 1775001600.0
+    }
+  }
+}
