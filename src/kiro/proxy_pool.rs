@@ -16,7 +16,9 @@ use crate::http_client::ProxyConfig;
 /// 代理池 API 响应外层结构
 #[derive(Debug, Clone, Deserialize)]
 struct ProxyApiResponse {
-    data: ProxyApiData,
+    success: bool,
+    data: Option<ProxyApiData>,
+    error: Option<String>,
 }
 
 /// 代理池 API 响应 data 字段
@@ -225,7 +227,15 @@ impl ProxyPool {
             .await
             .map_err(|e| anyhow::anyhow!("解析代理 API 响应失败: {}", e))?;
 
-        Ok(ProxyConfig::new(resp_data.data.proxy))
+        if !resp_data.success {
+            let reason = resp_data.error.as_deref().unwrap_or("未知原因");
+            anyhow::bail!("代理 API 无可用代理: {}", reason);
+        }
+
+        let data = resp_data.data
+            .ok_or_else(|| anyhow::anyhow!("代理 API 响应缺少 data 字段"))?;
+
+        Ok(ProxyConfig::new(data.proxy))
     }
 
     /// 获取代理池统计信息（用于调试）
