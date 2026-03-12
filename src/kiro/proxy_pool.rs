@@ -13,12 +13,17 @@ use serde::Deserialize;
 
 use crate::http_client::ProxyConfig;
 
-/// 代理池 API 返回的单个代理
+/// 代理池 API 响应外层结构
 #[derive(Debug, Clone, Deserialize)]
-pub struct ProxyApiResponse {
-    pub url: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
+struct ProxyApiResponse {
+    data: ProxyApiData,
+}
+
+/// 代理池 API 响应 data 字段
+#[derive(Debug, Clone, Deserialize)]
+struct ProxyApiData {
+    /// 完整代理地址，如 "http://123.45.67.89:8080"
+    proxy: String,
 }
 
 /// 代理条目内部状态
@@ -215,17 +220,12 @@ impl ProxyPool {
             anyhow::bail!("代理 API 返回错误: {} {}", status, body);
         }
 
-        let data: ProxyApiResponse = resp
+        let resp_data: ProxyApiResponse = resp
             .json()
             .await
             .map_err(|e| anyhow::anyhow!("解析代理 API 响应失败: {}", e))?;
 
-        let mut proxy = ProxyConfig::new(data.url);
-        if let (Some(username), Some(password)) = (data.username, data.password) {
-            proxy = proxy.with_auth(username, password);
-        }
-
-        Ok(proxy)
+        Ok(ProxyConfig::new(resp_data.data.proxy))
     }
 
     /// 获取代理池统计信息（用于调试）
