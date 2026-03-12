@@ -138,7 +138,7 @@ impl AdminService {
         let balance = self.fetch_balance(id).await?;
 
         // 更新缓存
-        {
+        let cache_snapshot = {
             let mut cache = self.balance_cache.lock();
             cache.insert(
                 id,
@@ -147,8 +147,19 @@ impl AdminService {
                     data: balance.clone(),
                 },
             );
+            // 快照缓存内容，锁立即释放
+            cache.iter().map(|(k, v)| (k.to_string(), v.clone())).collect::<HashMap<String, CachedBalance>>()
+        };
+        // 后台异步写盘，不阻塞响应
+        if let Some(path) = self.cache_path.clone() {
+            tokio::spawn(async move {
+                if let Ok(json) = serde_json::to_string_pretty(&cache_snapshot) {
+                    if let Err(e) = tokio::fs::write(&path, json).await {
+                        tracing::warn!("保存余额缓存失败: {}", e);
+                    }
+                }
+            });
         }
-        self.save_balance_cache();
 
         Ok(balance)
     }
@@ -237,11 +248,21 @@ impl AdminService {
             .map_err(|e| self.classify_delete_error(e, id))?;
 
         // 清理已删除凭据的余额缓存
-        {
+        let cache_snapshot = {
             let mut cache = self.balance_cache.lock();
             cache.remove(&id);
+            cache.iter().map(|(k, v)| (k.to_string(), v.clone())).collect::<HashMap<String, CachedBalance>>()
+        };
+        // 后台异步写盘，不阻塞响应
+        if let Some(path) = self.cache_path.clone() {
+            tokio::spawn(async move {
+                if let Ok(json) = serde_json::to_string_pretty(&cache_snapshot) {
+                    if let Err(e) = tokio::fs::write(&path, json).await {
+                        tracing::warn!("保存余额缓存失败: {}", e);
+                    }
+                }
+            });
         }
-        self.save_balance_cache();
 
         Ok(())
     }
@@ -306,27 +327,6 @@ impl AdminService {
                 }
             })
             .collect()
-    }
-
-    fn save_balance_cache(&self) {
-        let path = match &self.cache_path {
-            Some(p) => p,
-            None => return,
-        };
-
-        // 持有锁期间完成序列化和写入，防止并发损坏
-        let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> =
-            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
-
-        match serde_json::to_string_pretty(&map) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    tracing::warn!("保存余额缓存失败: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
-        }
     }
 
     // ============ 错误分类 ============

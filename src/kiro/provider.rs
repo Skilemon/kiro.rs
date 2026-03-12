@@ -64,8 +64,20 @@ impl KiroProvider {
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
+    ///
+    /// 代理优先级：凭据自身代理 > 代理池分配代理 > 全局代理
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let effective = if credentials.proxy_url.is_some() {
+            // 凭据自身配置了代理，直接使用
+            credentials.effective_proxy(self.global_proxy.as_ref())
+        } else if let Some(pool) = self.token_manager.proxy_pool() {
+            // 从代理池查询当前分配给该凭据的代理
+            let cred_id = credentials.id.unwrap_or(0);
+            pool.get_proxy_for(cred_id).or_else(|| self.global_proxy.clone())
+        } else {
+            credentials.effective_proxy(self.global_proxy.as_ref())
+        };
+
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
@@ -332,6 +344,7 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    self.token_manager.report_proxy_failure(ctx.id);
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -464,8 +477,8 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                    // 网络错误可能是代理故障，标记当前凭据的代理为故障并尝试换代理
+                    self.token_manager.report_proxy_failure(ctx.id);
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -683,6 +696,7 @@ mod tests {
             id: 1,
             credentials,
             token: "test_token".to_string(),
+            in_flight_guard: None,
         };
         let headers = provider.build_headers(&ctx).unwrap();
 

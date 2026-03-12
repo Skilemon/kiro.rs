@@ -90,6 +90,32 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+
+    // 如果启用了代理池，为所有凭据初始分配代理并启动后台健康检测
+    if let Some(pool) = token_manager.proxy_pool() {
+        let pool = pool.clone();
+        let snapshot = token_manager.snapshot();
+        let pool_init = pool.clone();
+        tokio::spawn(async move {
+            for entry in &snapshot.entries {
+                match pool_init.assign_proxy_for(entry.id).await {
+                    Ok(p) => tracing::info!("凭据 #{} 初始代理: {}", entry.id, p.url),
+                    Err(e) => tracing::warn!("凭据 #{} 初始分配代理失败: {}", entry.id, e),
+                }
+            }
+        });
+
+        // 后台每 60 秒健康检测一次
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await; // 跳过第一次立即触发
+            loop {
+                interval.tick().await;
+                pool.health_check_all().await;
+            }
+        });
+    }
+
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
 
     // 初始化 count_tokens 配置

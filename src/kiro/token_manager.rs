@@ -12,12 +12,14 @@ use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::proxy_pool::ProxyPool;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
@@ -388,6 +390,15 @@ pub(crate) async fn get_usage_limits(
 // 多凭据 Token 管理器
 // ============================================================================
 
+/// RAII guard：drop 时自动递减 in_flight 计数器
+pub(crate) struct InFlightGuard(Arc<AtomicUsize>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// 单个凭据条目的状态
 struct CredentialEntry {
     /// 凭据唯一 ID
@@ -404,6 +415,8 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 当前正在处理的并发请求数（Arc 使 CallContext 可持有引用）
+    in_flight: Arc<AtomicUsize>,
 }
 
 /// 禁用原因
@@ -486,8 +499,10 @@ pub struct MultiTokenManager {
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
+    /// 每个凭据独立的刷新锁，避免全局串行化
+    refresh_locks: parking_lot::Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
+    /// 单调递增的凭据 ID 分配器（原子操作，避免并发添加时的 TOCTOU）
+    next_id: AtomicU64,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
@@ -498,12 +513,16 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 代理池（可选，配置了 proxyApiUrl 时启用）
+    proxy_pool: Option<Arc<ProxyPool>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// priority 模式下 in_flight 超过此阈值时溢出到次优凭据
+const IN_FLIGHT_OVERFLOW_THRESHOLD: usize = 5;
 
 /// API 调用上下文
 ///
@@ -517,6 +536,8 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// RAII in-flight guard；None 表示测试/分离模式
+    pub in_flight_guard: Option<Arc<InFlightGuard>>,
 }
 
 impl MultiTokenManager {
@@ -537,7 +558,7 @@ impl MultiTokenManager {
     ) -> anyhow::Result<Self> {
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
-        let mut next_id = max_existing_id + 1;
+        let mut local_next_id = max_existing_id + 1;
         let mut has_new_ids = false;
         let mut has_new_machine_ids = false;
         let config_ref = &config;
@@ -547,8 +568,8 @@ impl MultiTokenManager {
             .map(|mut cred| {
                 cred.canonicalize_auth_method();
                 let id = cred.id.unwrap_or_else(|| {
-                    let id = next_id;
-                    next_id += 1;
+                    let id = local_next_id;
+                    local_next_id += 1;
                     cred.id = Some(id);
                     has_new_ids = true;
                     id
@@ -573,6 +594,7 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    in_flight: Arc::new(AtomicUsize::new(0)),
                 }
             })
             .collect();
@@ -597,17 +619,26 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+
+        // 初始化代理池（如果配置了 proxyApiUrl）
+        let proxy_pool = config.proxy_api_url.as_ref().map(|url| {
+            tracing::info!("已配置代理池 API: {}", url);
+            Arc::new(ProxyPool::new(url.clone(), config.tls_backend))
+        });
+
         let manager = Self {
             config,
             proxy,
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
-            refresh_lock: TokioMutex::new(()),
+            refresh_locks: parking_lot::Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(local_next_id),
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            proxy_pool,
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -628,6 +659,19 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 获取代理池引用（如果启用）
+    pub fn proxy_pool(&self) -> Option<&Arc<ProxyPool>> {
+        self.proxy_pool.as_ref()
+    }
+
+    /// 报告指定凭据的代理故障，并在下次请求时自动更换
+    pub fn report_proxy_failure(&self, credential_id: u64) {
+        if let Some(pool) = &self.proxy_pool {
+            pool.mark_proxy_failed(credential_id);
+            tracing::warn!("凭据 #{} 代理已故障，将在下次请求时自动更换", credential_id);
+        }
     }
 
     /// 获取当前活动凭据的克隆
@@ -651,14 +695,26 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    /// 获取（或创建）指定凭据 ID 的刷新锁
+    fn get_or_create_refresh_lock(&self, id: u64) -> Arc<TokioMutex<()>> {
+        let mut locks = self.refresh_locks.lock();
+        locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：轮询选择可用凭据
+    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据，in_flight 超过阈值时溢出到次优
+    /// - balanced 模式：以实时 in_flight 为主、历史 success_count 为辅选择最空闲凭据
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    ///
+    /// # 返回
+    /// `(凭据ID, 凭据信息, in_flight Arc)`
+    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials, Arc<AtomicUsize>)> {
         let entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -690,18 +746,36 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
+                // 以实时 in_flight 为主，历史 success_count 为辅，平局按优先级
                 let entry = available
                     .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                    .min_by_key(|e| (
+                        e.in_flight.load(Ordering::Relaxed),
+                        e.success_count,
+                        e.credentials.priority,
+                    ))?;
 
-                Some((entry.id, entry.credentials.clone()))
+                Some((entry.id, entry.credentials.clone(), Arc::clone(&entry.in_flight)))
             }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
-                Some((entry.id, entry.credentials.clone()))
+                // priority 模式（默认）：优先最高优先级凭据
+                // 当该凭据 in_flight 超过阈值时，溢出到当前最空闲的凭据
+                let best = available.iter().min_by_key(|e| e.credentials.priority)?;
+                let best_in_flight = best.in_flight.load(Ordering::Relaxed);
+
+                if best_in_flight < IN_FLIGHT_OVERFLOW_THRESHOLD {
+                    Some((best.id, best.credentials.clone(), Arc::clone(&best.in_flight)))
+                } else {
+                    // 超过阈值：选择 in_flight 最少的凭据（平局按 priority）
+                    let overflow = available
+                        .iter()
+                        .min_by_key(|e| (e.in_flight.load(Ordering::Relaxed), e.credentials.priority))?;
+                    tracing::debug!(
+                        "priority 模式溢出：凭据 #{} in_flight={} 超过阈值 {}，分流到凭据 #{}",
+                        best.id, best_in_flight, IN_FLIGHT_OVERFLOW_THRESHOLD, overflow.id
+                    );
+                    Some((overflow.id, overflow.credentials.clone(), Arc::clone(&overflow.in_flight)))
+                }
             }
         }
     }
@@ -729,11 +803,11 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
+            let (id, credentials, in_flight_arc) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 // balanced 模式：每次请求都轮询选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
+                // priority 模式：优先使用 current_id 指向的凭据（带 in_flight 溢出）
                 let current_hit = if is_balanced {
                     None
                 } else {
@@ -742,11 +816,27 @@ impl MultiTokenManager {
                     entries
                         .iter()
                         .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
+                        .map(|e| (e.id, e.credentials.clone(), Arc::clone(&e.in_flight)))
                 };
 
                 if let Some(hit) = current_hit {
-                    hit
+                    // priority 模式：检查当前凭据是否已超 in_flight 阈值
+                    let current_in_flight = hit.2.load(Ordering::Relaxed);
+                    if current_in_flight >= IN_FLIGHT_OVERFLOW_THRESHOLD {
+                        // 超阈值：通过 select_next_credential 选择最空闲凭据（不更新 current_id）
+                        match self.select_next_credential(model) {
+                            Some(overflow) => {
+                                tracing::debug!(
+                                    "priority 模式溢出：凭据 #{} in_flight={} 超过阈值 {}，分流到凭据 #{}",
+                                    hit.0, current_in_flight, IN_FLIGHT_OVERFLOW_THRESHOLD, overflow.0
+                                );
+                                overflow
+                            }
+                            None => hit,
+                        }
+                    } else {
+                        hit
+                    }
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
                     let mut best = self.select_next_credential(model);
@@ -772,11 +862,11 @@ impl MultiTokenManager {
                         }
                     }
 
-                    if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
+                    if let Some((new_id, new_creds, new_in_flight)) = best {
+                        // 更新 current_id（仅在非溢出模式下）
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
-                        (new_id, new_creds)
+                        (new_id, new_creds, new_in_flight)
                     } else {
                         let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
@@ -789,7 +879,7 @@ impl MultiTokenManager {
             };
 
             // 尝试获取/刷新 Token
-            match self.try_ensure_token(id, &credentials).await {
+            match self.try_ensure_token(id, &credentials, in_flight_arc).await {
                 Ok(ctx) => {
                     return Ok(ctx);
                 }
@@ -852,22 +942,26 @@ impl MultiTokenManager {
 
     /// 尝试使用指定凭据获取有效 Token
     ///
-    /// 使用双重检查锁定模式，确保同一时间只有一个刷新操作
+    /// 使用双重检查锁定模式（per-credential 锁），确保同一凭据同一时间只有一个刷新操作，
+    /// 不同凭据的刷新操作互不阻塞。
     ///
     /// # Arguments
     /// * `id` - 凭据 ID，用于更新正确的条目
     /// * `credentials` - 凭据信息
+    /// * `in_flight_arc` - 该凭据的 in_flight 计数器 Arc
     async fn try_ensure_token(
         &self,
         id: u64,
         credentials: &KiroCredentials,
+        in_flight_arc: Arc<AtomicUsize>,
     ) -> anyhow::Result<CallContext> {
         // 第一次检查（无锁）：快速判断是否需要刷新
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
         let creds = if needs_refresh {
-            // 获取刷新锁，确保同一时间只有一个刷新操作
-            let _guard = self.refresh_lock.lock().await;
+            // 获取该凭据专属的刷新锁，不阻塞其他凭据的并发刷新
+            let lock = self.get_or_create_refresh_lock(id);
+            let _guard = lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -881,7 +975,20 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                // 代理优先级：凭据自身代理 > 代理池分配代理 > 全局代理
+                let effective_proxy = if current_creds.proxy_url.is_some() {
+                    current_creds.effective_proxy(self.proxy.as_ref())
+                } else if let Some(pool) = &self.proxy_pool {
+                    match pool.assign_proxy_for(id).await {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            tracing::warn!("代理池获取代理失败，回退到全局代理: {}", e);
+                            self.proxy.clone()
+                        }
+                    }
+                } else {
+                    current_creds.effective_proxy(self.proxy.as_ref())
+                };
                 let new_creds =
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
 
@@ -897,10 +1004,8 @@ impl MultiTokenManager {
                     }
                 }
 
-                // 回写凭据到文件（仅多凭据格式），失败只记录警告
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                }
+                // 后台异步持久化，不阻塞当前请求
+                self.spawn_persist_credentials();
 
                 new_creds
             } else {
@@ -917,10 +1022,15 @@ impl MultiTokenManager {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))?;
 
+        // 递增 in_flight，构建 RAII guard（drop 时自动递减）
+        in_flight_arc.fetch_add(1, Ordering::Relaxed);
+        let guard = Arc::new(InFlightGuard(in_flight_arc));
+
         Ok(CallContext {
             id,
             credentials: creds,
             token,
+            in_flight_guard: Some(guard),
         })
     }
 
@@ -975,6 +1085,44 @@ impl MultiTokenManager {
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
         Ok(true)
+    }
+
+    /// 后台异步持久化凭据到文件（用于 Token 刷新路径，不阻塞当前请求）
+    ///
+    /// 与 `persist_credentials` 不同，此方法 fire-and-forget，
+    /// 适用于不需要等待写入完成的场景（如 Token 刷新后回写）。
+    fn spawn_persist_credentials(&self) {
+        if !self.is_multiple_format {
+            return;
+        }
+        let path = match &self.credentials_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let credentials: Vec<KiroCredentials> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .map(|e| {
+                    let mut cred = e.credentials.clone();
+                    cred.canonicalize_auth_method();
+                    cred.disabled = e.disabled;
+                    cred
+                })
+                .collect()
+        };
+        tokio::spawn(async move {
+            match serde_json::to_string_pretty(&credentials) {
+                Ok(json) => {
+                    if let Err(e) = tokio::fs::write(&path, json).await {
+                        tracing::warn!("后台持久化凭据失败: {}", e);
+                    } else {
+                        tracing::debug!("后台持久化凭据成功: {:?}", path);
+                    }
+                }
+                Err(e) => tracing::warn!("序列化凭据失败（后台持久化）: {}", e),
+            }
+        });
     }
 
     /// 获取缓存目录（凭据文件所在目录）
@@ -1357,7 +1505,9 @@ impl MultiTokenManager {
         let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
         let token = if needs_refresh {
-            let _guard = self.refresh_lock.lock().await;
+            // 使用凭据专属刷新锁，不阻塞其他凭据的并发刷新
+            let lock = self.get_or_create_refresh_lock(id);
+            let _guard = lock.lock().await;
             let current_creds = {
                 let entries = self.entries.lock();
                 entries
@@ -1377,10 +1527,8 @@ impl MultiTokenManager {
                         entry.credentials = new_creds.clone();
                     }
                 }
-                // 持久化失败只记录警告，不影响本次请求
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                }
+                // 后台异步持久化，不阻塞本次请求
+                self.spawn_persist_credentials();
                 new_creds
                     .access_token
                     .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
@@ -1485,11 +1633,8 @@ impl MultiTokenManager {
         let mut validated_cred =
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?;
 
-        // 4. 分配新 ID
-        let new_id = {
-            let entries = self.entries.lock();
-            entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
-        };
+        // 4. 分配新 ID（原子操作，避免并发添加时的 TOCTOU）
+        let new_id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
@@ -1522,6 +1667,7 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                in_flight: Arc::new(AtomicUsize::new(0)),
             });
         }
 
