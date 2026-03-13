@@ -444,6 +444,10 @@ impl KiroProvider {
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
+        // 连续 429 计数，达到阈值后换代理
+        let mut consecutive_429 = 0u32;
+        const MAX_429_BEFORE_PROXY_SWITCH: u32 = 3;
+
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
@@ -590,23 +594,30 @@ impl KiroProvider {
                     body
                 );
                 if status.as_u16() == 429 {
-                    self.token_manager.report_proxy_failure(ctx.id);
-                    // 立即为该凭据分配新代理并预热 client_cache
-                    if let Some(pool) = self.token_manager.proxy_pool() {
-                        match pool.assign_proxy_for(ctx.id).await {
-                            Ok(new_proxy) => {
-                                tracing::info!("凭据 #{} 换用新代理: {}", ctx.id, new_proxy.url);
-                                // 预热新代理对应的 Client
-                                let _ = self.client_cache.lock()
-                                    .entry(Some(new_proxy.clone()))
-                                    .or_insert_with(|| {
-                                        crate::http_client::build_client(Some(&new_proxy), 720, self.tls_backend)
-                                            .expect("构建代理 Client 失败")
-                                    });
+                    consecutive_429 += 1;
+                    if consecutive_429 >= MAX_429_BEFORE_PROXY_SWITCH {
+                        consecutive_429 = 0;
+                        self.token_manager.report_proxy_failure(ctx.id);
+                        // 连续 429 达到阈值，立即换代理并预热 client_cache
+                        if let Some(pool) = self.token_manager.proxy_pool() {
+                            match pool.assign_proxy_for(ctx.id).await {
+                                Ok(new_proxy) => {
+                                    tracing::info!("凭据 #{} 连续 429 {} 次，换用新代理: {}", ctx.id, MAX_429_BEFORE_PROXY_SWITCH, new_proxy.url);
+                                    let _ = self.client_cache.lock()
+                                        .entry(Some(new_proxy.clone()))
+                                        .or_insert_with(|| {
+                                            crate::http_client::build_client(Some(&new_proxy), 720, self.tls_backend)
+                                                .expect("构建代理 Client 失败")
+                                        });
+                                }
+                                Err(e) => tracing::warn!("凭据 #{} 换代理失败: {}", ctx.id, e),
                             }
-                            Err(e) => tracing::warn!("凭据 #{} 换代理失败: {}", ctx.id, e),
                         }
+                    } else {
+                        tracing::info!("凭据 #{} 429 ({}/{}），继续重试当前代理", ctx.id, consecutive_429, MAX_429_BEFORE_PROXY_SWITCH);
                     }
+                } else {
+                    consecutive_429 = 0;
                 }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
