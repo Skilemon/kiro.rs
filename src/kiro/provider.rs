@@ -17,7 +17,7 @@ use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -35,7 +35,7 @@ pub struct KiroProvider {
     global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
-    client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    client_cache: RwLock<HashMap<Option<ProxyConfig>, Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
 }
@@ -58,7 +58,7 @@ impl KiroProvider {
         Self {
             token_manager,
             global_proxy: proxy,
-            client_cache: Mutex::new(cache),
+            client_cache: RwLock::new(cache),
             tls_backend,
         }
     }
@@ -78,13 +78,31 @@ impl KiroProvider {
             credentials.effective_proxy(self.global_proxy.as_ref())
         };
 
-        let mut cache = self.client_cache.lock();
+        // 读锁快速路径（绝大多数请求命中缓存）
+        {
+            let cache = self.client_cache.read();
+            if let Some(client) = cache.get(&effective) {
+                return Ok(client.clone());
+            }
+        }
+
+        // 写锁慢速路径：首次为该代理配置创建 Client
+        let mut cache = self.client_cache.write();
+        // 二次检查：防止并发线程重复创建
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
         }
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
+    }
+
+    /// 判断当前凭据是否正在使用代理池分配的代理（而非静态代理或全局隧道代理）
+    ///
+    /// 只有 proxy_api_url 模式下、且凭据本身未配置静态代理时，才允许自动切换代理。
+    /// 使用单一代理（凭据 proxy_url）或隧道代理（global_proxy）时不进行切换。
+    fn is_using_pool_proxy(&self, credentials: &KiroCredentials) -> bool {
+        credentials.proxy_url.is_none() && self.token_manager.proxy_pool().is_some()
     }
 
     /// 获取 token_manager 的引用
@@ -327,9 +345,17 @@ impl KiroProvider {
                 }
             };
 
+            // 获取 client（RwLock 读锁快速路径）
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
             // 发送请求
-            let response = match self
-                .client_for(&ctx.credentials)?
+            let response = match client
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())
@@ -389,7 +415,8 @@ impl KiroProvider {
                 continue;
             }
 
-            // 瞬态错误，429 时额外触发换代理
+            // 瞬态错误，429 时仅在代理池模式下才触发换代理
+            // 静态代理和隧道代理不进行切换
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -398,7 +425,7 @@ impl KiroProvider {
                     status,
                     body
                 );
-                if status.as_u16() == 429 {
+                if status.as_u16() == 429 && self.is_using_pool_proxy(&ctx.credentials) {
                     self.token_manager.report_proxy_failure(ctx.id);
                 }
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
@@ -467,10 +494,18 @@ impl KiroProvider {
                 }
             };
 
-            // 打印当前请求使用的代理
-            {
-                let proxy_info = if ctx.credentials.proxy_url.is_some() {
-                    ctx.credentials.proxy_url.clone().unwrap()
+            // 获取 client（RwLock 读锁快速路径），并从缓存 key 反推实际代理用于日志
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
+            if tracing::enabled!(tracing::Level::INFO) {
+                let proxy_info = if let Some(ref u) = ctx.credentials.proxy_url {
+                    u.clone()
                 } else if let Some(pool) = self.token_manager.proxy_pool() {
                     pool.get_proxy_for(ctx.id)
                         .map(|p| p.url)
@@ -481,9 +516,8 @@ impl KiroProvider {
                 tracing::info!("凭据 #{} 使用代理: {}", ctx.id, proxy_info);
             }
 
-            // 发送请求
-            let response = match self
-                .client_for(&ctx.credentials)?
+            // 发送请求（复用上方已获取的 client，避免重复加锁）
+            let response = match client
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())
@@ -498,8 +532,11 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    // 网络错误可能是代理故障，标记当前凭据的代理为故障并尝试换代理
-                    self.token_manager.report_proxy_failure(ctx.id);
+                    // 网络错误可能是代理故障；仅代理池模式下才切换代理
+                    // 使用静态代理或隧道代理时不进行切换
+                    if self.is_using_pool_proxy(&ctx.credentials) {
+                        self.token_manager.report_proxy_failure(ctx.id);
+                    }
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -594,27 +631,30 @@ impl KiroProvider {
                     body
                 );
                 if status.as_u16() == 429 {
-                    consecutive_429 += 1;
-                    if consecutive_429 >= MAX_429_BEFORE_PROXY_SWITCH {
-                        consecutive_429 = 0;
-                        self.token_manager.report_proxy_failure(ctx.id);
-                        // 连续 429 达到阈值，立即换代理并预热 client_cache
-                        if let Some(pool) = self.token_manager.proxy_pool() {
-                            match pool.assign_proxy_for(ctx.id).await {
-                                Ok(new_proxy) => {
-                                    tracing::info!("凭据 #{} 连续 429 {} 次，换用新代理: {}", ctx.id, MAX_429_BEFORE_PROXY_SWITCH, new_proxy.url);
-                                    let _ = self.client_cache.lock()
-                                        .entry(Some(new_proxy.clone()))
-                                        .or_insert_with(|| {
-                                            crate::http_client::build_client(Some(&new_proxy), 720, self.tls_backend)
-                                                .expect("构建代理 Client 失败")
-                                        });
+                    // 仅代理池模式下才进行代理切换，静态代理和隧道代理不切换
+                    if self.is_using_pool_proxy(&ctx.credentials) {
+                        consecutive_429 += 1;
+                        if consecutive_429 >= MAX_429_BEFORE_PROXY_SWITCH {
+                            consecutive_429 = 0;
+                            self.token_manager.report_proxy_failure(ctx.id);
+                            // 连续 429 达到阈值，立即换代理并预热 client_cache
+                            if let Some(pool) = self.token_manager.proxy_pool() {
+                                match pool.assign_proxy_for(ctx.id).await {
+                                    Ok(new_proxy) => {
+                                        tracing::info!("凭据 #{} 连续 429 {} 次，换用新代理: {}", ctx.id, MAX_429_BEFORE_PROXY_SWITCH, new_proxy.url);
+                                        let _ = self.client_cache.write()
+                                            .entry(Some(new_proxy.clone()))
+                                            .or_insert_with(|| {
+                                                crate::http_client::build_client(Some(&new_proxy), 720, self.tls_backend)
+                                                    .expect("构建代理 Client 失败")
+                                            });
+                                    }
+                                    Err(e) => tracing::warn!("凭据 #{} 换代理失败: {}", ctx.id, e),
                                 }
-                                Err(e) => tracing::warn!("凭据 #{} 换代理失败: {}", ctx.id, e),
                             }
+                        } else {
+                            tracing::info!("凭据 #{} 429 ({}/{}），继续重试当前代理", ctx.id, consecutive_429, MAX_429_BEFORE_PROXY_SWITCH);
                         }
-                    } else {
-                        tracing::info!("凭据 #{} 429 ({}/{}），继续重试当前代理", ctx.id, consecutive_429, MAX_429_BEFORE_PROXY_SWITCH);
                     }
                 } else {
                     consecutive_429 = 0;
@@ -666,14 +706,13 @@ impl KiroProvider {
     }
 
     fn retry_delay(attempt: usize) -> Duration {
-        // 指数退避 + 少量抖动，避免上游抖动时放大故障
+        // Full jitter 指数退避：delay = rand(0, min(MAX_MS, BASE_MS * 2^attempt))
+        // 相比固定退避+小抖动，full jitter 在高并发时更均匀地分散重试，消除雷群效应
         const BASE_MS: u64 = 200;
         const MAX_MS: u64 = 2_000;
-        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
-        let backoff = exp.min(MAX_MS);
-        let jitter_max = (backoff / 4).max(1);
-        let jitter = fastrand::u64(0..=jitter_max);
-        Duration::from_millis(backoff.saturating_add(jitter))
+        let cap = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32)).min(MAX_MS);
+        let jitter = fastrand::u64(0..=cap);
+        Duration::from_millis(jitter)
     }
 
     fn is_monthly_request_limit(body: &str) -> bool {

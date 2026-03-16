@@ -497,8 +497,8 @@ pub struct MultiTokenManager {
     proxy: Option<ProxyConfig>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
-    /// 当前活动凭据 ID
-    current_id: Mutex<u64>,
+    /// 当前活动凭据 ID（原子操作，避免额外锁开销）
+    current_id: AtomicU64,
     /// 每个凭据独立的刷新锁，避免全局串行化
     refresh_locks: parking_lot::Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
     /// 单调递增的凭据 ID 分配器（原子操作，避免并发添加时的 TOCTOU）
@@ -630,7 +630,7 @@ impl MultiTokenManager {
             config,
             proxy,
             entries: Mutex::new(entries),
-            current_id: Mutex::new(initial_id),
+            current_id: AtomicU64::new(initial_id),
             refresh_locks: parking_lot::Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(local_next_id),
             credentials_path,
@@ -677,7 +677,7 @@ impl MultiTokenManager {
     /// 获取当前活动凭据的克隆
     pub fn credentials(&self) -> KiroCredentials {
         let entries = self.entries.lock();
-        let current_id = *self.current_id.lock();
+        let current_id = self.current_id.load(Ordering::Acquire);
         entries
             .iter()
             .find(|e| e.id == current_id)
@@ -715,6 +715,10 @@ impl MultiTokenManager {
     /// # 返回
     /// `(凭据ID, 凭据信息, in_flight Arc)`
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials, Arc<AtomicUsize>)> {
+        // 先读取负载均衡模式，再加 entries 锁，避免持有 entries 锁时再加第二把锁
+        let mode = self.load_balancing_mode.lock().clone();
+        let mode = mode.as_str();
+
         let entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -740,9 +744,6 @@ impl MultiTokenManager {
         if available.is_empty() {
             return None;
         }
-
-        let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
 
         match mode {
             "balanced" => {
@@ -812,7 +813,7 @@ impl MultiTokenManager {
                     None
                 } else {
                     let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
+                    let current_id = self.current_id.load(Ordering::Acquire);
                     entries
                         .iter()
                         .find(|e| e.id == current_id && !e.disabled)
@@ -864,8 +865,7 @@ impl MultiTokenManager {
 
                     if let Some((new_id, new_creds, new_in_flight)) = best {
                         // 更新 current_id（仅在非溢出模式下）
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
+                        self.current_id.store(new_id, Ordering::Release);
                         (new_id, new_creds, new_in_flight)
                     } else {
                         let entries = self.entries.lock();
@@ -897,15 +897,15 @@ impl MultiTokenManager {
     /// 切换到下一个优先级最高的可用凭据（内部方法）
     fn switch_to_next_by_priority(&self) {
         let entries = self.entries.lock();
-        let mut current_id = self.current_id.lock();
+        let current_id = self.current_id.load(Ordering::Acquire);
 
         // 选择优先级最高的未禁用凭据（排除当前凭据）
         if let Some(entry) = entries
             .iter()
-            .filter(|e| !e.disabled && e.id != *current_id)
+            .filter(|e| !e.disabled && e.id != current_id)
             .min_by_key(|e| e.credentials.priority)
         {
-            *current_id = entry.id;
+            self.current_id.store(entry.id, Ordering::Release);
             tracing::info!(
                 "已切换到凭据 #{}（优先级 {}）",
                 entry.id,
@@ -920,7 +920,7 @@ impl MultiTokenManager {
     /// 纯粹按优先级选择，用于优先级变更后立即生效
     fn select_highest_priority(&self) {
         let entries = self.entries.lock();
-        let mut current_id = self.current_id.lock();
+        let current_id = self.current_id.load(Ordering::Acquire);
 
         // 选择优先级最高的未禁用凭据（不排除当前凭据）
         if let Some(best) = entries
@@ -928,14 +928,14 @@ impl MultiTokenManager {
             .filter(|e| !e.disabled)
             .min_by_key(|e| e.credentials.priority)
         {
-            if best.id != *current_id {
+            if best.id != current_id {
                 tracing::info!(
                     "优先级变更后切换凭据: #{} -> #{}（优先级 {}）",
-                    *current_id,
+                    current_id,
                     best.id,
                     best.credentials.priority
                 );
-                *current_id = best.id;
+                self.current_id.store(best.id, Ordering::Release);
             }
         }
     }
@@ -1193,15 +1193,24 @@ impl MultiTokenManager {
     }
 
     /// 标记统计数据已更新，并按 debounce 策略决定是否立即落盘
+    ///
+    /// 使用「持锁期间检查+预占位」策略：将时间戳在持锁内提前更新，
+    /// 后续并发线程会看到刚刚写入的时间戳而直接跳过，确保同一窗口内只有一个线程落盘。
     fn save_stats_debounced(&self) {
         self.stats_dirty.store(true, Ordering::Relaxed);
 
         let should_flush = {
-            let last = *self.last_stats_save_at.lock();
-            match last {
+            let mut last = self.last_stats_save_at.lock();
+            let now = Instant::now();
+            let elapsed_enough = match *last {
                 Some(last_saved_at) => last_saved_at.elapsed() >= STATS_SAVE_DEBOUNCE,
                 None => true,
+            };
+            if elapsed_enough {
+                // 预占位：先写入当前时间，阻止其他并发线程重复落盘
+                *last = Some(now);
             }
+            elapsed_enough
         };
 
         if should_flush {
@@ -1242,7 +1251,6 @@ impl MultiTokenManager {
     pub fn report_failure(&self, id: u64) -> bool {
         let result = {
             let mut entries = self.entries.lock();
-            let mut current_id = self.current_id.lock();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
@@ -1271,7 +1279,7 @@ impl MultiTokenManager {
                     .filter(|e| !e.disabled)
                     .min_by_key(|e| e.credentials.priority)
                 {
-                    *current_id = next.id;
+                    self.current_id.store(next.id, Ordering::Release);
                     tracing::info!(
                         "已切换到凭据 #{}（优先级 {}）",
                         next.id,
@@ -1297,7 +1305,6 @@ impl MultiTokenManager {
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
         let result = {
             let mut entries = self.entries.lock();
-            let mut current_id = self.current_id.lock();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
@@ -1322,7 +1329,7 @@ impl MultiTokenManager {
                 .filter(|e| !e.disabled)
                 .min_by_key(|e| e.credentials.priority)
             {
-                *current_id = next.id;
+                self.current_id.store(next.id, Ordering::Release);
                 tracing::info!(
                     "已切换到凭据 #{}（优先级 {}）",
                     next.id,
@@ -1343,15 +1350,15 @@ impl MultiTokenManager {
     /// 返回是否成功切换
     pub fn switch_to_next(&self) -> bool {
         let entries = self.entries.lock();
-        let mut current_id = self.current_id.lock();
+        let current_id = self.current_id.load(Ordering::Acquire);
 
         // 选择优先级最高的未禁用凭据（排除当前凭据）
         if let Some(next) = entries
             .iter()
-            .filter(|e| !e.disabled && e.id != *current_id)
+            .filter(|e| !e.disabled && e.id != current_id)
             .min_by_key(|e| e.credentials.priority)
         {
-            *current_id = next.id;
+            self.current_id.store(next.id, Ordering::Release);
             tracing::info!(
                 "已切换到凭据 #{}（优先级 {}）",
                 next.id,
@@ -1360,7 +1367,7 @@ impl MultiTokenManager {
             true
         } else {
             // 没有其他可用凭据，检查当前凭据是否可用
-            entries.iter().any(|e| e.id == *current_id && !e.disabled)
+            entries.iter().any(|e| e.id == current_id && !e.disabled)
         }
     }
 
@@ -1384,7 +1391,7 @@ impl MultiTokenManager {
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
         let entries = self.entries.lock();
-        let current_id = *self.current_id.lock();
+        let current_id = self.current_id.load(Ordering::Acquire);
         let available = entries.iter().filter(|e| !e.disabled).count();
 
         ManagerSnapshot {
@@ -1697,7 +1704,7 @@ impl MultiTokenManager {
             }
 
             // 记录是否是当前凭据
-            let current_id = *self.current_id.lock();
+            let current_id = self.current_id.load(Ordering::Acquire);
             let was_current = current_id == id;
 
             // 删除凭据
@@ -1715,8 +1722,7 @@ impl MultiTokenManager {
         {
             let entries = self.entries.lock();
             if entries.is_empty() {
-                let mut current_id = self.current_id.lock();
-                *current_id = 0;
+                self.current_id.store(0, Ordering::Release);
                 tracing::info!("所有凭据已删除，current_id 已重置为 0");
             }
         }

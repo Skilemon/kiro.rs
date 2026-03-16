@@ -5,11 +5,13 @@
 //! - 代理故障时自动从接口获取新代理（不复用已故障代理）
 //! - 后台定期健康检测（TCP 连接探测）
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Deserialize;
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::http_client::ProxyConfig;
 
@@ -52,6 +54,8 @@ pub struct ProxyPool {
     failed_urls: Mutex<HashSet<String>>,
     /// TLS 后端（用于健康检测时构建 client）
     tls_backend: crate::model::config::TlsBackend,
+    /// per-credential 异步分配锁，消除 assign_proxy_for 的 TOCTOU 竞态
+    assign_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
 }
 
 impl ProxyPool {
@@ -62,6 +66,7 @@ impl ProxyPool {
             entries: Mutex::new(Vec::new()),
             failed_urls: Mutex::new(HashSet::new()),
             tls_backend,
+            assign_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -92,9 +97,11 @@ impl ProxyPool {
     /// 为指定凭据分配一个代理
     ///
     /// 优先复用已分配给该凭据的代理（若未故障）；
-    /// 否则从接口获取新代理并记录分配关系
+    /// 否则从接口获取新代理并记录分配关系。
+    ///
+    /// 使用 per-credential 异步锁，消除并发调用时重复获取代理的 TOCTOU 竞态。
     pub async fn assign_proxy_for(&self, credential_id: u64) -> anyhow::Result<ProxyConfig> {
-        // 先查是否已有分配且未故障的代理
+        // 快速路径：无锁前置检查，已有可用代理直接返回
         {
             let entries = self.entries.lock();
             if let Some(entry) = entries
@@ -105,7 +112,25 @@ impl ProxyPool {
             }
         }
 
-        // 没有可用的已分配代理，从接口获取新代理
+        // 获取（或创建）该凭据的分配锁，序列化同一凭据的并发分配请求
+        let lock = {
+            let mut locks = self.assign_locks.lock();
+            Arc::clone(locks.entry(credential_id).or_insert_with(|| Arc::new(TokioMutex::new(()))))
+        };
+        let _guard = lock.lock().await;
+
+        // 持锁后二次检查：前一个并发请求可能已完成分配
+        {
+            let entries = self.entries.lock();
+            if let Some(entry) = entries
+                .iter()
+                .find(|e| e.assigned_to == Some(credential_id) && !e.failed)
+            {
+                return Ok(entry.config.clone());
+            }
+        }
+
+        // 确认无可用代理，从接口获取新代理
         let proxy = self.fetch_new_proxy().await?;
 
         {
@@ -175,12 +200,28 @@ impl ProxyPool {
                 .collect()
         };
 
-        for (credential_id, proxy) in to_check {
-            if !self.check_proxy_alive(&proxy).await {
+        // 并行探测所有代理，不再串行等待每个 TCP 连接
+        let futs = to_check.iter().map(|(credential_id, proxy)| async move {
+            let alive = self.check_proxy_alive(proxy).await;
+            (*credential_id, alive)
+        });
+        let results = futures::future::join_all(futs).await;
+
+        for (credential_id, alive) in results {
+            if !alive {
+                // 找到对应 url 用于日志
+                let url = {
+                    let entries = self.entries.lock();
+                    entries
+                        .iter()
+                        .find(|e| e.assigned_to == Some(credential_id) && !e.failed)
+                        .map(|e| e.config.url.clone())
+                        .unwrap_or_default()
+                };
                 tracing::warn!(
                     "健康检测：凭据 #{} 的代理 {} 不可达，标记为故障",
                     credential_id,
-                    proxy.url
+                    url
                 );
                 self.mark_proxy_failed(credential_id);
             }
