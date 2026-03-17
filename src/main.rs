@@ -91,23 +91,19 @@ async fn main() {
     });
     let token_manager = Arc::new(token_manager);
 
-    // 如果启用了代理池，为所有凭据初始分配代理并启动后台健康检测
+    // 如果启用了代理池，启动时一次性批量为所有活跃凭据分配代理
     if let Some(pool) = token_manager.proxy_pool() {
         let pool = pool.clone();
         let snapshot = token_manager.snapshot();
-        let pool_init = pool.clone();
         tokio::spawn(async move {
-            for entry in &snapshot.entries {
-                match pool_init.assign_proxy_for(entry.id).await {
-                    Ok(p) => tracing::info!("凭据 #{} 初始代理: {}", entry.id, p.url),
-                    Err(e) => tracing::warn!("凭据 #{} 初始分配代理失败: {}", entry.id, e),
-                }
+            let ids: Vec<u64> = snapshot.entries.iter()
+                .filter(|e| !e.disabled)
+                .map(|e| e.id)
+                .collect();
+            if let Err(e) = pool.assign_proxies_batch(&ids).await {
+                tracing::warn!("批量分配代理失败: {}", e);
             }
         });
-
-        // 健康检测已禁用（探测端点在部分网络不可达，导致代理误判为故障）
-        // 代理故障由实际请求的网络错误/429 触发换代理
-        let _ = pool;
     }
 
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
