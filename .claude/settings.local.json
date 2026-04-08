@@ -9,7 +9,11 @@
       "Bash(Get-ChildItem:*)",
       "Bash(Get-Content $_FullName })",
       "Bash(cmd /c:*)",
-      "Bash(exit:*)"
+      "Bash(exit:*)",
+      "Bash(grep -E '\\\\.\\(ts|js|py|go|rs|java|cpp|c|h\\)$')",
+      "Bash(\"E:\\\\qdy\\\\kiro.rs\\\\admin-ui\\\\dist\\\\index.html\")",
+      "Bash(git add:*)",
+      "Bash(git restore:*)"
     ]
   }
 }

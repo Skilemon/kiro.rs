@@ -82,12 +82,6 @@ pub struct Config {
     #[serde(default)]
     pub proxy_password: Option<String>,
 
-    /// 代理池 API 地址（可选）
-    /// 每次需要新代理时调用该接口获取，接口返回 JSON: {"url":"http://...","username":"...","password":"..."}
-    /// username 和 password 字段可选
-    #[serde(default)]
-    pub proxy_api_url: Option<String>,
-
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
@@ -114,7 +108,7 @@ fn default_region() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "0.10.0".to_string()
+    "0.11.107".to_string()
 }
 
 fn default_system_version() -> String {
@@ -123,7 +117,7 @@ fn default_system_version() -> String {
 }
 
 fn default_node_version() -> String {
-    "22.21.1".to_string()
+    "22.22.0".to_string()
 }
 
 fn default_count_tokens_auth_type() -> String {
@@ -158,7 +152,6 @@ impl Default for Config {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
-            proxy_api_url: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             config_path: None,

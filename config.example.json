@@ -4,6 +4,5 @@
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
   "tlsBackend": "rustls",
   "region": "us-east-1",
-  "adminApiKey": "sk-admin-your-secret-key",
-  "proxyApiUrl": "http://your-proxy-api/getSingleProxy"
+  "adminApiKey": "sk-admin-your-secret-key"
 }

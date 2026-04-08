@@ -21,6 +21,7 @@ import {
   useSetPriority,
   useResetFailure,
   useDeleteCredential,
+  useForceRefreshToken,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -64,6 +65,7 @@ export function CredentialCard({
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
+  const forceRefresh = useForceRefreshToken()
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -110,6 +112,17 @@ export function CredentialCard({
     })
   }
 
+  const handleForceRefresh = () => {
+    forceRefresh.mutate(credential.id, {
+      onSuccess: (res) => {
+        toast.success(res.message)
+      },
+      onError: (err) => {
+        toast.error('刷新失败: ' + (err as Error).message)
+      },
+    })
+  }
+
   const handleDelete = () => {
     if (!credential.disabled) {
       toast.error('请先禁用凭据再删除')
@@ -145,6 +158,9 @@ export function CredentialCard({
                 )}
                 {credential.disabled && (
                   <Badge variant="destructive">已禁用</Badge>
+                )}
+                {credential.disabled && credential.disabledReason && (
+                  <Badge variant="outline">{credential.disabledReason}</Badge>
                 )}
               </CardTitle>
             </div>
@@ -210,6 +226,12 @@ export function CredentialCard({
               </span>
             </div>
             <div>
+              <span className="text-muted-foreground">刷新失败：</span>
+              <span className={credential.refreshFailureCount > 0 ? 'text-red-500 font-medium' : ''}>
+                {credential.refreshFailureCount}
+              </span>
+            </div>
+            <div>
               <span className="text-muted-foreground">订阅等级：</span>
               <span className="font-medium">
                 {loadingBalance ? (
@@ -261,10 +283,20 @@ export function CredentialCard({
               size="sm"
               variant="outline"
               onClick={handleReset}
-              disabled={resetFailure.isPending || credential.failureCount === 0}
+              disabled={resetFailure.isPending || (credential.failureCount === 0 && credential.refreshFailureCount === 0)}
             >
               <RefreshCw className="h-4 w-4 mr-1" />
               重置失败
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleForceRefresh}
+              disabled={forceRefresh.isPending || credential.disabled}
+              title={credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
+            >
+              <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
+              刷新 Token
             </Button>
             <Button
               size="sm"

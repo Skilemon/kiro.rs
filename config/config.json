@@ -4,17 +4,17 @@
   "region": "us-east-1",
   "kiroVersion": "0.10.0",
   "machineId": null,
-  "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+  "apiKey": "sk-kiro-rs-qazWSXedcRFV123456-gxufe1b614",
   "systemVersion": "darwin#24.6.0",
   "nodeVersion": "22.21.1",
   "tlsBackend": "rustls",
   "countTokensApiUrl": null,
   "countTokensApiKey": null,
   "countTokensAuthType": "x-api-key",
-  "proxyUrl": null,
+  "proxyUrl": "http://116.80.49.168:3172",
   "proxyUsername": null,
   "proxyPassword": null,
   "adminApiKey": "sk-admin-your-secret-key",
   "loadBalancingMode": "balanced",
-  "proxyApiUrl": "http://host.docker.internal:8416/api/getSingleProxy"
+  "proxyApiUrl": null
 }
