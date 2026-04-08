@@ -19,14 +19,14 @@ use crate::http_client::ProxyConfig;
 #[derive(Debug, Clone, Deserialize)]
 struct ProxyApiResponse {
     success: bool,
-    data: Option<ProxyApiData>,
+    data: Option<Vec<ProxyApiItem>>,
     error: Option<String>,
 }
 
-/// 代理池 API 响应 data 字段
+/// 代理池 API 响应 data 数组中的单条代理
 #[derive(Debug, Clone, Deserialize)]
-struct ProxyApiData {
-    /// 完整代理地址，如 "http://123.45.67.89:8080"
+struct ProxyApiItem {
+    /// 完整代理地址，如"http://123.45.67.89:8080"
     proxy: String,
 }
 
@@ -251,9 +251,14 @@ impl ProxyPool {
         }
     }
 
-    /// 调用代理 API 获取一个代理
-    async fn call_proxy_api(&self) -> anyhow::Result<ProxyConfig> {
-        let resp = reqwest::get(&self.api_url)
+    /// 调用代理 API 批量获取代理
+    async fn call_proxy_api_batch(&self, count: usize) -> anyhow::Result<Vec<ProxyConfig>> {
+        let url = if self.api_url.contains('?') {
+            format!("{}&count={}", self.api_url, count)
+        } else {
+            format!("{}?count={}", self.api_url, count)
+        };
+        let resp = reqwest::get(&url)
             .await
             .map_err(|e| anyhow::anyhow!("调用代理 API 失败: {}", e))?;
 
@@ -273,10 +278,61 @@ impl ProxyPool {
             anyhow::bail!("代理 API 无可用代理: {}", reason);
         }
 
-        let data = resp_data.data
+        let items = resp_data
+            .data
             .ok_or_else(|| anyhow::anyhow!("代理 API 响应缺少 data 字段"))?;
 
-        Ok(ProxyConfig::new(data.proxy))
+        Ok(items.into_iter().map(|item| ProxyConfig::new(item.proxy)).collect())
+    }
+
+    /// 调用代理 API 获取一个代理
+    async fn call_proxy_api(&self) -> anyhow::Result<ProxyConfig> {
+        let proxies = self.call_proxy_api_batch(1).await?;
+        proxies.into_iter().next()
+            .ok_or_else(|| anyhow::anyhow!("代理 API 返回空列表"))
+    }
+
+    /// 批量为多个凭据分配代理（启动时一次性调用）
+    ///
+    /// 一次请求拉取 credential_ids.len() 个代理，逐一分配
+    pub async fn assign_proxies_batch(&self, credential_ids: &[u64]) -> anyhow::Result<()> {
+        if credential_ids.is_empty() {
+            return Ok(());
+        }
+
+        let count = credential_ids.len();
+        let failed_urls = self.failed_urls.lock().clone();
+
+        tracing::info!("批量拉取 {} 个代理...", count);
+        let proxies = self.call_proxy_api_batch(count).await?;
+
+        let mut entries = self.entries.lock();
+        let mut proxy_iter = proxies.into_iter();
+        for credential_id in credential_ids.iter() {
+            // 若该凭据已有未故障代理，跳过
+            if entries.iter().any(|e| e.assigned_to == Some(*credential_id) && !e.failed) {
+                continue;
+            }
+
+            let Some(proxy) = proxy_iter.next() else {
+                tracing::warn!("代理 API 返回数量不足，凭据 #{} 无代理分配", credential_id);
+                continue;
+            };
+
+            if failed_urls.contains(&proxy.url) {
+                tracing::warn!("凭据 #{} 分配的代理 {} 在故障列表中，仍使用", credential_id, proxy.url);
+            }
+
+            tracing::info!("凭据 #{} 初始代理: {}", credential_id, proxy.url);
+            entries.push(ProxyEntry {
+                config: proxy,
+                failed: false,
+                failed_at: None,
+                assigned_to: Some(*credential_id),
+            });
+        }
+
+        Ok(())
     }
 
     /// 获取代理池统计信息（用于调试）
